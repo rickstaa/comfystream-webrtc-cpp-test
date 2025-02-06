@@ -6,7 +6,8 @@
 #include <chrono>
 #include <opencv2/opencv.hpp>
 
-extern "C" {
+extern "C"
+{
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/imgutils.h>
@@ -32,68 +33,93 @@ std::string sendSDPToServer(const std::string &sdp)
     request["prompt"] = prompt;
 
     auto res = cli.Post("/offer", request.dump(), "application/json");
-    if (res && res->status == 200)
-    {
-        return res->body;
-    }
-    return "";
+    return (res && res->status == 200) ? res->body : "";
 }
 
-/**
- * Initialize FFmpeg encoder.
- */
-AVCodecContext* initFFmpegEncoder(int width, int height)
+AVCodecContext *initFFmpegEncoder(int width, int height)
 {
-    const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_H264);
-    if (!codec) {
+    const AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+    if (!codec)
+    {
         std::cerr << "Codec not found" << std::endl;
         return nullptr;
     }
 
-    AVCodecContext* c = avcodec_alloc_context3(codec);
-    if (!c) {
+    AVCodecContext *c = avcodec_alloc_context3(codec);
+    if (!c)
+    {
         std::cerr << "Could not allocate video codec context" << std::endl;
         return nullptr;
     }
 
-    c->bit_rate = 400000;
+    c->bit_rate = 500000;
     c->width = width;
     c->height = height;
     c->time_base = {1, 30};
     c->framerate = {30, 1};
-    c->gop_size = 10;
-    c->max_b_frames = 1;
+    c->gop_size = 30; // ✅ Force keyframe every 30 frames
+    c->max_b_frames = 0;
     c->pix_fmt = AV_PIX_FMT_YUV420P;
+    c->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    c->codec_tag = 0;
 
-    if (avcodec_open2(c, codec, nullptr) < 0) {
+    AVDictionary *opts = NULL;
+    av_dict_set(&opts, "preset", "ultrafast", 0);
+    av_dict_set(&opts, "tune", "zerolatency", 0);
+    av_dict_set(&opts, "profile", "baseline", 0);
+    av_dict_set(&opts, "packetization_mode", "1", 0); // ✅ Ensures fragmented NALUs
+    av_dict_set(&opts, "keyint_min", "30", 0);
+    av_dict_set(&opts, "sc_threshold", "0", 0);
+    av_dict_set(&opts, "refs", "1", 0);
+    av_dict_set(&opts, "force_key_frames", "expr:gte(t,n_forced*2)", 0);
+
+    if (avcodec_open2(c, codec, &opts) < 0)
+    {
         std::cerr << "Could not open codec" << std::endl;
         return nullptr;
     }
 
+    av_dict_free(&opts);
     return c;
 }
 
-/**
- * Encode a frame using FFmpeg.
- */
-bool encodeFrame(AVCodecContext* c, AVFrame* frame, AVPacket* pkt, std::vector<std::byte>& encodedData)
+bool encodeFrame(AVCodecContext *c, AVFrame *frame, AVPacket *pkt, std::vector<uint8_t> &encodedData)
 {
+    frame->pict_type = AV_PICTURE_TYPE_I; // ✅ Use AV_PICTURE_TYPE_I (fix)
+    frame->flags |= AV_FRAME_FLAG_KEY;    // ✅ Modern replacement for `key_frame`
+
     int ret = avcodec_send_frame(c, frame);
-    if (ret < 0) {
-        std::cerr << "Error sending a frame for encoding" << std::endl;
+    if (ret < 0)
+    {
+        char errbuf[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(ret, errbuf, AV_ERROR_MAX_STRING_SIZE);
+        std::cerr << "Error sending a frame for encoding: " << errbuf << std::endl;
         return false;
     }
 
-    while (ret >= 0) {
+    while (ret >= 0)
+    {
         ret = avcodec_receive_packet(c, pkt);
-        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
             return true;
-        } else if (ret < 0) {
-            std::cerr << "Error during encoding" << std::endl;
+        else if (ret < 0)
+        {
+            char errbuf[AV_ERROR_MAX_STRING_SIZE];
+            av_strerror(ret, errbuf, AV_ERROR_MAX_STRING_SIZE);
+            std::cerr << "Error during encoding: " << errbuf << std::endl;
             return false;
         }
 
-        encodedData.insert(encodedData.end(), reinterpret_cast<std::byte*>(pkt->data), reinterpret_cast<std::byte*>(pkt->data + pkt->size));
+        if (pkt->size < 500)
+        {
+            std::cerr << "[C++] Warning: Small H.264 packet, size = " << pkt->size << " bytes" << std::endl;
+        }
+        else
+        {
+            encodedData.insert(encodedData.end(), pkt->data, pkt->data + pkt->size);
+            std::cout << "[DEBUG] Encoded frame size: " << pkt->size << " bytes" << std::endl;
+        }
+
         av_packet_unref(pkt);
     }
 
@@ -109,39 +135,13 @@ int main()
     rtc::Configuration config;
     config.iceServers.emplace_back("stun:stun.l.google.com:19302");
     auto pc = std::make_shared<rtc::PeerConnection>(config);
-
-    // ### Trickling ICE - Not Working ###
-    // // Handle the local description when it's generated and send it to the server (trickle ICE)
-    // NOTE: Doesn't seem to work with ComfyStream server.
-    // pc->onLocalDescription([&pc](rtc::Description sdp)
-    //                        {
-    //     std::cout << "Generated SDP Offer:\n" << std::string(sdp) << std::endl;
-
-    //     std::string server_response = sendSDPToServer(std::string(sdp));
-
-    //     if (server_response.empty()) {
-    //         std::cerr << "Failed to receive SDP answer from server!" << std::endl;
-    //         return;
-    //     }
-
-    //     json response_json = json::parse(server_response);
-    //     std::string sdp_answer = response_json["sdp"];
-
-    //     std::cout << "Received SDP Answer:\n" << sdp_answer << std::endl;
-
-    //     pc->setRemoteDescription(rtc::Description(sdp_answer, sdp.type()));
-    //     std::cout << "Connection established!" << std::endl; });
-    // pc->onGatheringStateChange([pc](rtc::PeerConnection::GatheringState state)
-    //                         { std::cout << "[Gathering State Change] New state: " << state << std::endl; });
-    // ### Trickling ICE - Not Working ###
-
     // ### Non-Trickling ICE - Working ###
     // Handle the local description when it's generated and send it to the server.
     pc->onLocalDescription([&pc](rtc::Description sdp)
                            { std::cout << "Generated SDP Offer:\n"
                                        << std::string(sdp) << std::endl; });
 
-    // Step 4: Send the SDP offer to the server and handle the SDP answer.
+     // Step 4: Send the SDP offer to the server and handle the SDP answer.
     pc->onGatheringStateChange([&pc](rtc::PeerConnection::GatheringState state)
                                {
         std::cout << "Gathering State: " << state << std::endl;
@@ -167,15 +167,18 @@ int main()
             pc->setRemoteDescription(rtc::Description(sdp_answer, "answer"));
             std::cout << "Connection established!" << std::endl;
         } });
-     // ### Non-Trickling ICE - Working ###
+    // ### Non-Trickling ICE - Working ###
 
     // Add other event listeners.
     pc->onLocalCandidate([](rtc::Candidate candidate)
                          { std::cout << "[Local Candidate] " << candidate << std::endl; });
+
     pc->onStateChange([](rtc::PeerConnection::State state)
                       { std::cout << "[PeerConnection State Change] New state: " << state << std::endl; });
+
     pc->onIceStateChange([](rtc::PeerConnection::IceState state)
                          { std::cout << "[ICE State Change] New state: " << state << std::endl; });
+
     pc->onSignalingStateChange([](rtc::PeerConnection::SignalingState state)
                                { std::cout << "[Signaling State Change] New state: " << state << std::endl; });
     pc->onTrack([](std::shared_ptr<rtc::Track> track)
@@ -186,20 +189,13 @@ int main()
         }); });
 
     // Step 2: Add video channel to the PeerConnection.
-    // rtc::Description::Video media("video", rtc::Description::Direction::SendRecv);
-    // media.addH264Codec(102); // Match AI server's codec
-    // media.addSSRC(42, "video-send");
-    // auto track = pc->addTrack(media);
     const rtc::SSRC ssrc = 42;
-    rtc::Description::Video media("video", rtc::Description::Direction::SendOnly);
-    media.addH264Codec(96); // Must match the payload type of the external h264 RTP stream
+    rtc::Description::Video media("video", rtc::Description::Direction::SendRecv);
+    media.addH264Codec(102);
     media.addSSRC(ssrc, "video-send");
     auto track = pc->addTrack(media);
     if (!track)
-    {
-        std::cerr << "Failed to add video track" << std::endl;
         return -1;
-    }
 
     // Step 3: Add a data channel to the PeerConnection.
     auto dc = pc->createDataChannel("control");
@@ -223,109 +219,54 @@ int main()
     // Step 5: Wait until the track is open before sending dummy data.
     std::atomic<bool> trackOpen{false};
     track->onOpen([&trackOpen]()
-                  {
-        trackOpen = true;
-        std::cout << "Track is open" << std::endl; });
+                  { trackOpen = true; });
 
-    // Wait until the track is open.
     while (!trackOpen)
-    {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
 
-    // ### Dummy Data
-    // // Step 6: Send dummy video frames to verify the connection.
-    // cv::Mat dummyFrame(480, 640, CV_8UC3, cv::Scalar(0, 255, 0)); // Green frame
-    // std::vector<uchar> buf;
-    // cv::imencode(".jpg", dummyFrame, buf);
-    // std::vector<std::byte> dummyData(buf.size());
-    // std::transform(buf.begin(), buf.end(), dummyData.begin(), [](uchar c) {
-    //     return std::byte(c);
-    // });
-
-    // while (true) {
-    //     track->send(dummyData.data(), dummyData.size());
-    //     std::cout << "Sent dummy frame of size: " << dummyData.size() << std::endl;
-    //     std::this_thread::sleep_for(std::chrono::milliseconds(1000)); // Send every second
-    // }
-    // ### Dummy Data
-
-    // ### Webcam Data - Not Working ###
-    // Step 6: Capture and send camera data.
-    cv::VideoCapture cap(0); // Open the default camera
-    if (!cap.isOpened()) {
-        std::cerr << "Failed to open camera" << std::endl;
+    int width = 640, height = 480;
+    AVCodecContext *codecContext = initFFmpegEncoder(width, height);
+    if (!codecContext)
         return -1;
-    }
 
-    int width = 640;
-    int height = 480;
-    AVCodecContext* codecContext = initFFmpegEncoder(width, height);
-    if (!codecContext) {
+    AVFrame *frame = av_frame_alloc();
+    if (!frame)
         return -1;
-    }
 
-    AVFrame* frame = av_frame_alloc();
-    if (!frame) {
-        std::cerr << "Could not allocate video frame" << std::endl;
-        return -1;
-    }
     frame->format = codecContext->pix_fmt;
     frame->width = codecContext->width;
     frame->height = codecContext->height;
+    av_image_alloc(frame->data, frame->linesize, width, height, codecContext->pix_fmt, 32);
 
-    int ret = av_image_alloc(frame->data, frame->linesize, codecContext->width, codecContext->height, codecContext->pix_fmt, 32);
-    if (ret < 0) {
-        std::cerr << "Could not allocate raw picture buffer" << std::endl;
+    AVPacket *pkt = av_packet_alloc();
+    if (!pkt)
         return -1;
-    }
 
-    AVPacket* pkt = av_packet_alloc();
-    if (!pkt) {
-        std::cerr << "Could not allocate AVPacket" << std::endl;
+    cv::Mat dummyFrame(height, width, CV_8UC3, cv::Scalar(0, 255, 0));
+    SwsContext *swsContext = sws_getContext(width, height, AV_PIX_FMT_BGR24, width, height, AV_PIX_FMT_YUV420P, SWS_BILINEAR, nullptr, nullptr, nullptr);
+    if (!swsContext)
         return -1;
-    }
 
-    SwsContext* swsContext = sws_getContext(width, height, AV_PIX_FMT_BGR24, width, height, AV_PIX_FMT_YUV420P, SWS_BILINEAR, nullptr, nullptr, nullptr);
-    if (!swsContext) {
-        std::cerr << "Could not initialize the conversion context" << std::endl;
-        return -1;
-    }
-
-    cv::Mat bgrFrame;
-    while (true) {
-        cap >> bgrFrame; // Capture a new frame from the camera
-        if (bgrFrame.empty()) {
-            std::cerr << "Failed to capture frame" << std::endl;
-            continue;
-        }
-
-        // Convert the frame to YUV420P
-        const uint8_t* inData[1] = { bgrFrame.data };
-        int inLinesize[1] = { static_cast<int>(bgrFrame.step[0]) };
+    while (true)
+    {
+        const uint8_t *inData[1] = {dummyFrame.data};
+        int inLinesize[1] = {static_cast<int>(dummyFrame.step[0])};
         sws_scale(swsContext, inData, inLinesize, 0, height, frame->data, frame->linesize);
+        frame->pts++;
 
-        // Encode the frame
-        std::vector<std::byte> encodedData;
-        if (!encodeFrame(codecContext, frame, pkt, encodedData)) {
-            std::cerr << "Failed to encode frame" << std::endl;
+        std::vector<uint8_t> encodedData;
+        if (!encodeFrame(codecContext, frame, pkt, encodedData))
             continue;
+
+        for (size_t i = 0; i < encodedData.size(); i += 1200)
+        {
+            size_t packetSize = std::min(1200UL, encodedData.size() - i);
+            std::vector<uint8_t> packet(encodedData.begin() + i, encodedData.begin() + i + packetSize);
+            std::vector<std::byte> bytePacket(reinterpret_cast<std::byte *>(packet.data()),
+                                              reinterpret_cast<std::byte *>(packet.data() + packet.size()));
+            std::cout << "[C++] Sent RTP packet - Size: " << packetSize << std::endl;
         }
 
-        // Send encoded frame as RTP packets
-        size_t maxPacketSize = 1200; // Maximum RTP packet size
-        for (size_t i = 0; i < encodedData.size(); i += maxPacketSize) {
-            size_t packetSize = std::min(maxPacketSize, encodedData.size() - i);
-            track->send(encodedData.data() + i, packetSize);
-        }
-
-        std::cout << "Sent frame of size: " << encodedData.size() << std::endl;
-        std::this_thread::sleep_for(std::chrono::milliseconds(33)); // Send at ~30 FPS
+        std::this_thread::sleep_for(std::chrono::milliseconds(33));
     }
-
-    av_packet_free(&pkt);
-    av_frame_free(&frame);
-    avcodec_free_context(&codecContext);
-    sws_freeContext(swsContext);
-    // ### Webcam Data - Not Working ###
 }
