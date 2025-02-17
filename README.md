@@ -2,6 +2,18 @@
 
 This repository contains my test code for connecting an C++ WebRTC client to an python WebRTC server.
 
+
+## Prerequisites
+
+- Python 3.11
+- Conda
+- CMake
+- Build Essentials (for Linux)
+- `nlohmann_json`
+- [LibDataChannel](https://github.com/paullouisageneau/libdatachannel)
+- `OpenCV`
+- `FFmpeg`
+
 ## Testing Instructions  
 
 1. **Set up a Python environment and install dependencies:**  
@@ -26,18 +38,28 @@ This repository contains my test code for connecting an C++ WebRTC client to an 
    python3 webrtc_server.py
    ```
 
-5. **Compile the C++ client** by installing the required build tools and using CMake:  
+5. **Install the Libdatachannels library:** Follow the instructions from the [LibDataChannel GitHub repository](https://github.com/paullouisageneau/libdatachannel) to install LibDataChannel.
+
+6. **Install C++ Dependencies:**
+
+    ```bash
+    sudo apt-get install nlohmann-json3-dev
+    sudo apt-get install libopencv-dev
+    sudo apt-get install libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
+    sudo apt install build-essential
+    ```
+
+7. **Compile the C++ client** by installing the required build tools and using CMake:  
 
    ```bash
-   sudo apt install build-essential
    cmake .
    cmake --build .
    ```
 
-6. **Run the C++ client:**  
+8. **Run the C++ client:**  
 
    ```bash
    ./webrtc-client
    ```
   
-7. **Observe that C++ client communication is broken:** Despite data being sent, the `recv` method of `MediaStreamTrack` is never triggered.
+9.  **Observe that C++ client communication is broken:** Despite data being sent, the `recv` method of `MediaStreamTrack` is never triggered.
