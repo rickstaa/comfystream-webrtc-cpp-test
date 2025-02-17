@@ -11,6 +11,15 @@ logging.basicConfig(level=logging.INFO)
 MAX_BITRATE = 2000000
 MIN_BITRATE = 2000000
 
+import logging
+
+logging.getLogger("aiortc").setLevel(logging.DEBUG)
+logging.getLogger("aiortc.stun").setLevel(logging.DEBUG)
+logging.getLogger("aiortc.rtcdtlstransport").setLevel(logging.DEBUG)
+logging.getLogger("aiortc.rtcrtpsender").setLevel(logging.DEBUG)
+logging.getLogger("aiortc.rtcrtpreceiver").setLevel(logging.DEBUG)
+
+
 class VideoStreamTrack(MediaStreamTrack):
     kind = "video"
 
